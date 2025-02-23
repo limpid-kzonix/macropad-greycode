@@ -1,11 +1,15 @@
 #include <Arduino.h>
+
+#include <Keyboard.h>
 #include <Keypad.h>
 
 #include <Adafruit_GFX.h>
+#include <Adafruit_NeoPixel.h>
 #include <Adafruit_SSD1306.h>
+
 #include <Wire.h>
 
-// region Keypad
+// region keypad
 
 #define ROWS_NUM 3
 #define COLS_NUM 3
@@ -22,111 +26,171 @@ char keys[ROWS_NUM][COLS_NUM] = {
     {'2', '5', '8'}, 
     {'1', '4', '7'},
   };
-
 // clang-format on
+
 Keypad keypad = Keypad(makeKeymap(keys), rows, cols, ROWS_NUM, COLS_NUM);
 
-// endregion Keypad
+// Define layers
+enum Layer { BASE, FN_LAYER };
 
-// region OLED 0.91 Inch display with SSD1306 driver
+Layer currentLayer = BASE;
+bool layerToggle = false; // Tracks if we are in the second layer
 
-#define SCREEN_WIDTH 128
-#define SCREEN_HEIGHT 64
+// Special Key (e.g., hold '5' to switch layer)
+#define LAYER_SWITCH_KEY '5'
+// endregion keypad
 
-Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+// region encoder
 
-// endregion OLED 0.91 Inch display with SSD1306 driver
+#define ENCODER_CLK SCL
+#define ENCODER_DT SDA
+#define ENCODER_SW D0
 
-// region KY-040 Rotary Encoder
+void readEncoder();
+// Variables to hold the current and last encoder position
+volatile int encoderPos = 0;
+int lastEncoderPos = 0;
 
-#define ENCODER_CLK A0
-#define ENCODER_DT D15
-#define ENCODER_SW MISO
+// Variables to keep track of the state of the pins
+int lastCLK;
+int currentCLK;
+// endregion encoder
 
-// region KY-040 Rotary Encoder
+// region LED
+
+#define LED_STRIP_PIN A0
+#define LED_RING_PIN MISO
+#define NUMPIXELS 8
+
+Adafruit_NeoPixel strip =
+    Adafruit_NeoPixel(NUMPIXELS, LED_STRIP_PIN, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel ring =
+    Adafruit_NeoPixel(NUMPIXELS, LED_RING_PIN, NEO_GRB + NEO_KHZ800);
+// endregion LED
 
 // region setup
 void setup() {
 
-	// region Serial
-	Serial.begin(9600);
+	Keyboard.begin();
 
-	while (!Serial) {
-		;
-	}
+	// region Serial
+	Wire.begin();
+
 	// endregion Serial
 
-	Serial.println("Starting: OLED 0.91 Inch display with SSD1306 driver");
-
-	if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-		Serial.println(F("SSD1306 allocation failed"));
-		for (;;)
-			;
-	}
-
-	display.display();
-	delay(2000);
-
-	display.clearDisplay();
-	display.setRotation(1);
-	display.setTextSize(2);
-	display.setTextColor(SSD1306_WHITE);
-	display.setCursor(0, 0);
-	display.println("Hello, world!");
-	display.display();
-
-	Serial.println(
-	    "Started successfully: OLED 0.91 Inch display with SSD1306 driver");
-
-	// region KY-040 Rotary Encoder
-	pinMode(ENCODER_CLK, INPUT);
-	pinMode(ENCODER_DT, INPUT);
+	// region encoder-setup
+	pinMode(ENCODER_CLK, INPUT_PULLUP);
+	pinMode(ENCODER_DT, INPUT_PULLUP);
 	pinMode(ENCODER_SW, INPUT_PULLUP);
 
+	attachInterrupt(digitalPinToInterrupt(ENCODER_CLK), readEncoder,
+			CHANGE);
+	digitalWrite(ENCODER_CLK, HIGH);
+
+	lastCLK = digitalRead(ENCODER_CLK);
 	Serial.println("Starting: KY-040 Rotary Encoder");
-	// endregion KY-040 Rotary Encoder
+	// endregion encoder-setup
+
+	// region LED-setup
+	strip.begin();
+	strip.setBrightness(100);
+	strip.show(); // Initialize all pixels to 'off'
+
+	strip.setPixelColor(0, 255, 0, 0);
+	strip.setPixelColor(1, 0, 255, 0);
+	strip.setPixelColor(2, 0, 0, 255);
+	strip.setPixelColor(3, 255, 255, 0);
+	strip.setPixelColor(4, 255, 0, 255);
+	strip.setPixelColor(5, 0, 255, 255);
+	strip.setPixelColor(6, 255, 255, 255);
+	strip.setPixelColor(7, 22, 123, 33);
+	strip.show();
+
+	ring.begin();
+	ring.setBrightness(100);
+	ring.show(); // Initialize all pixels to 'off'
+
+	ring.setPixelColor(0, 255, 0, 0);
+	ring.setPixelColor(1, 0, 255, 0);
+	ring.setPixelColor(2, 0, 0, 255);
+	ring.setPixelColor(3, 255, 255, 0);
+	ring.setPixelColor(4, 255, 0, 255);
+	ring.setPixelColor(5, 0, 255, 255);
+	ring.setPixelColor(6, 255, 255, 255);
+	ring.setPixelColor(7, 0, 99, 110);
+
+	ring.show();
+
+	// endregion LED-setup
 }
-// endregion setup
-int encoderPos = 0;     // Global variable to store the encoder position
-int lastCLK;            // Last state of the CLK pin
+
+void readEncoder() {
+	currentCLK = digitalRead(ENCODER_CLK);
+	// If the current state of CLK is different from the last state
+	// then a pulse occurred
+	if (currentCLK != lastCLK) {
+		// If the DT state is different from the CLK state
+		// then the encoder is rotating clockwise
+		if (digitalRead(ENCODER_DT) != currentCLK) {
+			encoderPos++;
+		} else {
+			// Otherwise, it's rotating counterclockwise
+			encoderPos--;
+		}
+	}
+	// Update lastCLK with the current state for the next pulse detection
+	lastCLK = currentCLK;
+}
+
+#define DEBOUNCE_DELAY 50
+unsigned long lastKeyPress = 0;
+
+bool isCtrlPressed = false;
 
 // region loop
 void loop() {
 	int keys = keypad.getKeys();
 
 	if (keys) {
+		delay(10);
+
 		for (int i = 0; i < LIST_MAX; i++) {
-			if (keypad.key[i].kstate == PRESSED) {
+			if (keypad.key[i].kstate == PRESSED &&
+			    keypad.key[i].stateChanged) {
 				Serial.print("Key Pressed: ");
 				Serial.println(keypad.key[i].kchar);
+				Keyboard.press(keypad.key[i].kchar);
+				delay(10);
+			} else if (keypad.key[i].kstate == RELEASED &&
+				   keypad.key[i].stateChanged) {
+				Serial.print("Key Released: ");
+				Serial.println(keypad.key[i].kchar);
+				Keyboard.release(keypad.key[i].kchar);
+				delay(10);
 			}
 		}
 	}
-	// Read the current state of the CLK pin
-  int currentCLK = digitalRead(ENCODER_CLK);
+	// Check if the encoder has moved
+	if (encoderPos != lastEncoderPos) {
+		Serial.print("Position: ");
+		Serial.println(encoderPos);
+		lastEncoderPos = encoderPos;
+	}
 
-  // If the CLK state has changed, then a rotation has occurred
-  if (currentCLK != lastCLK) {
-    // Compare the state of DT to determine rotation direction
-    if (digitalRead(ENCODER_DT) != currentCLK) {
-      encoderPos++;   // Clockwise rotation
-    } else {
-      encoderPos--;   // Counterclockwise rotation
-    }
-    Serial.print("Encoder Position: ");
-    Serial.println(encoderPos);
-  }
-  
-  // Update lastCLK for the next iteration
-  lastCLK = currentCLK;
-  
-  // Check if the switch (button) is pressed (active low)
-  if (digitalRead(ENCODER_SW) == LOW) {
-    Serial.println("Encoder Button Pressed");
-    delay(300);  // Simple debounce delay
-  }
-  
-  delay(1); // Small delay to improve stability
+	// Check if the button is pressed
+	if (digitalRead(ENCODER_SW) == LOW) {
+		// Reset the encoder position to 0
+		encoderPos = 0;
+		Serial.println("Reset to 0");
+		// Wait for the button to be released
+		while (digitalRead(ENCODER_SW) == LOW)
+			delay(10);
+			if (encoderPos != lastEncoderPos) {
+				Serial.print("Held and Position: ");
+				Serial.println(encoderPos);
+				lastEncoderPos = encoderPos;
+			}
+	}
 }
 
 // endregion loop
